@@ -1,8 +1,8 @@
 /**
- * OpenCode HTTP API client — dispatch only.
+ * OpenCode HTTP API client — dispatch with completion callback.
  *
  * Ported from Hermes hermes-opencode-bridge/api.py
- * Creates a session, injects rules, sends task, returns immediately.
+ * Creates a session, injects rules + completion instruction, sends task, returns.
  */
 
 import { readFile } from "node:fs/promises";
@@ -19,6 +19,8 @@ export interface DispatchParams {
   directory: string;
   task: string;
   title?: string;
+  /** Extra instruction appended after the task (e.g. completion callback). */
+  appendInstruction?: string;
 }
 
 export interface DispatchResult {
@@ -35,11 +37,10 @@ export async function dispatch(
   config: ServerConfig,
   rulesPath?: string,
 ): Promise<DispatchResult> {
-  const { directory, task, title } = params;
+  const { directory, task, title, appendInstruction } = params;
 
   // Check server is running
   if (!await isRunning(config)) {
-    // Try to wait for boot (maybe lifecycle hook just started it)
     const ready = await waitUntilReady(config, 5);
     if (!ready) {
       return {
@@ -51,7 +52,7 @@ export async function dispatch(
 
   const baseUrl = `http://localhost:${config.port}`;
 
-  // Create session — directory goes in X-OpenCode-Directory header
+  // Create session
   let sessionId = "";
   let sessionTitle = title ?? "";
 
@@ -88,10 +89,16 @@ export async function dispatch(
   // Load rules
   const rules = await loadRules(rulesPath);
 
-  // Compose message: rules + task
-  const messageText = rules
-    ? `<system_rules>\n${rules}\n</system_rules>\n\n<task>\n${task}\n</task>`
-    : task;
+  // Compose message: rules + task + appendInstruction (with real session_id)
+  let messageText = "";
+  if (rules) {
+    messageText += `<system_rules>\n${rules}\n</system_rules>\n\n`;
+  }
+  messageText += `<task>\n${task}\n</task>`;
+  if (appendInstruction) {
+    // Replace __SESSION_ID__ placeholder with real session id
+    messageText += appendInstruction.replace(/__SESSION_ID__/g, sessionId);
+  }
 
   // Send task via prompt_async (fire and forget)
   try {

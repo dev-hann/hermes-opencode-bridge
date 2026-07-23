@@ -7,15 +7,23 @@
  *   [A] Behavior rules    → before_prompt_build hook (inject directive on code keywords)
  *   [B] OpenCode work rules → prepend to message body on dispatch
  *   [C] Server lifecycle  → gateway_start hook (auto-start in background)
+ *
+ * Plus completion callback:
+ *   [D] OpenCode runs curl on task completion → plugin receives → notifies OpenClaw session
  */
 
+import { randomBytes } from "node:crypto";
 import { Type } from "typebox";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { ensureServer, type ServerConfig } from "./server.js";
 import { dispatch } from "./api.js";
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyPluginEntry = any;
+import {
+  buildCompletionInstruction,
+  verifyToken,
+  readBody,
+  sendJson,
+  type CallbackPayload,
+} from "./callback.js";
 
 // ---------------------------------------------------------------------------
 // [A] Behavior rules — inject directive when code keywords are detected
@@ -72,17 +80,20 @@ function hasCodeKeyword(message: string): boolean {
 // ---------------------------------------------------------------------------
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyPluginEntry = any;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const entry: AnyPluginEntry = definePluginEntry({
   id: "opencode-bridge",
   name: "OpenCode Bridge",
   description:
-    "Delegate ALL code work to OpenCode. Manages server lifecycle, injects collaboration rules, and dispatches tasks via HTTP API.",
+    "Delegate ALL code work to OpenCode. Manages server lifecycle, injects collaboration rules, and dispatches tasks via HTTP API. Receives completion callbacks and notifies the session.",
 
   register(api) {
     // -- Config ----------------------------------------------------------
 
     const getConfig = (): ServerConfig => {
-      const raw = api.config as Record<string, unknown> | undefined;
+      const raw = api.pluginConfig as Record<string, unknown> | undefined;
       return {
         port: (raw?.port as number) ?? 4096,
         hostname: (raw?.hostname as string) ?? "0.0.0.0",
@@ -90,10 +101,103 @@ const entry: AnyPluginEntry = definePluginEntry({
     };
 
     const getRulesPath = (): string | undefined => {
-      const raw = api.config as Record<string, unknown> | undefined;
+      const raw = api.pluginConfig as Record<string, unknown> | undefined;
       const val = raw?.rulesFile as string | undefined;
       return val || undefined;
     };
+
+    // -- Callback token (generated once per Gateway startup) ------------
+
+    const CALLBACK_TOKEN = randomBytes(16).toString("hex");
+    const CALLBACK_PATH = "/__opencode-bridge__/callback";
+    const OPENCLAW_PORT = api.config?.gateway?.port ?? 4445;
+
+    // Track dispatched sessions → sessionKey for callback routing
+    const sessionMap = new Map<string, { sessionKey: string; title: string }>();
+
+    // Track current session key from hook events
+    let currentSessionKey = "";
+
+    // -- [D] Completion callback HTTP route -----------------------------
+
+    api.registerHttpRoute({
+      path: CALLBACK_PATH,
+      auth: "plugin",
+      match: "exact",
+      async handler(req, res) {
+        if (req.method !== "POST") {
+          sendJson(res, 405, { error: "Method not allowed" });
+          return true;
+        }
+
+        if (!verifyToken(req, CALLBACK_TOKEN)) {
+          sendJson(res, 401, { error: "Invalid callback token" });
+          return true;
+        }
+
+        try {
+          const bodyRaw = await readBody(req);
+          const payload = JSON.parse(bodyRaw) as CallbackPayload & {
+            status?: string;
+            summary?: string;
+          };
+
+          const sessionId = payload.session_id;
+          const status = payload.status ?? "completed";
+
+          // Find the OpenClaw session that dispatched this
+          const mapping = sessionMap.get(sessionId);
+          if (!mapping) {
+            sendJson(res, 404, {
+              error: "Unknown session_id",
+              session_id: sessionId,
+            });
+            return true;
+          }
+
+          // Clean up mapping
+          sessionMap.delete(sessionId);
+
+          // Build notification message
+          const title = payload.session_title || mapping.title;
+          const summary = payload.summary
+            ? `\n\n**Summary:** ${payload.summary}`
+            : "";
+
+          const message =
+            status === "error"
+              ? `🔴 OpenCode 작업 실패: **${title}**\n` +
+                `세션: \`${sessionId}\`\n` +
+                `웹 UI: http://localhost:${getConfig().port}/session/${sessionId}` +
+                summary
+              : `✅ OpenCode 작업 완료: **${title}**\n` +
+                `세션: \`${sessionId}\`\n` +
+                `웹 UI: http://localhost:${getConfig().port}/session/${sessionId}` +
+                summary;
+
+          // Inject into next agent turn for the session
+          await api.session.workflow.enqueueNextTurnInjection({
+            sessionKey: mapping.sessionKey,
+            text: message,
+            idempotencyKey: `opencode-bridge-${sessionId}`,
+            placement: "append_context",
+          });
+
+          api.logger?.info?.(
+            `opencode-bridge: callback received for session ${sessionId} (${status})`,
+          );
+
+          sendJson(res, 200, { received: true, status });
+        } catch (e) {
+          api.logger?.error?.(
+            `opencode-bridge: callback parse error: ${e instanceof Error ? e.message : String(e)}`,
+          );
+          sendJson(res, 400, { error: "Invalid JSON body" });
+        }
+
+        return true;
+      },
+    });
 
     // -- [C] Server lifecycle: start on Gateway startup ----------------
 
@@ -101,12 +205,19 @@ const entry: AnyPluginEntry = definePluginEntry({
       const config = getConfig();
       const status = await ensureServer(config);
       api.logger?.info?.(`opencode server: ${status}`);
+      api.logger?.info?.(
+        `opencode-bridge: callback route at ${CALLBACK_PATH} (token: ${CALLBACK_TOKEN.slice(0, 8)}...)`,
+      );
     });
 
     // -- [A] Behavior rules: inject directive on code keywords ----------
-    // Use before_prompt_build to prepend context when code keywords detected
 
-    api.on("before_prompt_build", (event) => {
+    api.on("before_prompt_build", (event: { prompt: string }, ctx: { sessionKey?: string }) => {
+      // Capture session key for callback routing
+      if (ctx?.sessionKey) {
+        currentSessionKey = ctx.sessionKey;
+      }
+
       const userMessage = event.prompt ?? "";
       if (!hasCodeKeyword(userMessage)) return;
 
@@ -125,7 +236,8 @@ const entry: AnyPluginEntry = definePluginEntry({
         "This is the ONLY sanctioned path for code changes — do NOT use " +
         "terminal/write/edit for code implementation. " +
         "Break large tasks into 2-5 minute chunks before dispatching. " +
-        "Returns session info and web UI URL.",
+        "Returns session info and web UI URL. " +
+        "You will be automatically notified when the task completes.",
       parameters: Type.Object({
         directory: Type.String({
           description: "Absolute path to the project directory",
@@ -140,15 +252,44 @@ const entry: AnyPluginEntry = definePluginEntry({
       async execute(_id: string, params: Record<string, unknown>) {
         const config = getConfig();
         const rulesPath = getRulesPath();
+
+        // Build callback URL — route through OpenClaw Gateway
+        const callbackUrl = `http://localhost:${OPENCLAW_PORT}${CALLBACK_PATH}`;
+
+        // Build completion instruction with placeholder session ID
+        // (api.ts replaces __SESSION_ID__ with the real session id after creation)
+        const completionInstruction = buildCompletionInstruction({
+          callbackUrl,
+          token: CALLBACK_TOKEN,
+          sessionId: "__SESSION_ID__",
+          sessionTitle: (params.title as string) ?? "",
+          directory: params.directory as string,
+        });
+
         const result = await dispatch(
           {
             directory: params.directory as string,
             task: params.task as string,
             title: params.title as string | undefined,
+            appendInstruction: completionInstruction,
           },
           config,
           rulesPath,
         );
+
+        // If dispatch succeeded, register the session for callback routing
+        if (result.status === "dispatched" && result.session_id) {
+          // Track for callback
+          sessionMap.set(result.session_id, {
+            sessionKey: currentSessionKey,
+            title: result.session_name ?? (params.title as string) ?? "untitled",
+          });
+
+          api.logger?.info?.(
+            `opencode-bridge: tracking session ${result.session_id} for callbacks`,
+          );
+        }
+
         return {
           content: [
             {
