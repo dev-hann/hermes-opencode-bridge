@@ -1,7 +1,6 @@
 /**
  * OpenCode server lifecycle management.
  *
- * Ported from Hermes hermes-opencode-bridge/server.py
  * Handles: install check, health check, process discovery, auto-start.
  */
 

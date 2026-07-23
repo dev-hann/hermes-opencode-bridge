@@ -3,7 +3,7 @@
  *
  * Ported from Hermes hermes-opencode-bridge (Python) to OpenClaw plugin (TypeScript).
  *
- * Three-layer design (same as Hermes):
+ * Three-layer design:
  *   [A] Behavior rules    → before_prompt_build hook (inject directive on code keywords)
  *   [B] OpenCode work rules → prepend to message body on dispatch
  *   [C] Server lifecycle  → gateway_start hook (auto-start in background)

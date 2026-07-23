@@ -1,7 +1,6 @@
 /**
  * OpenCode HTTP API client — dispatch with completion callback.
  *
- * Ported from Hermes hermes-opencode-bridge/api.py
  * Creates a session, injects rules + completion instruction, sends task, returns.
  */
 
