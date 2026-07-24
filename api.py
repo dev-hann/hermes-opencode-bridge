@@ -24,6 +24,13 @@ def _http(method: str, path: str, body: dict | None = None, timeout: int = 30) -
         return json.loads(raw)
 
 
+def _b64url(text: str) -> str:
+    """Base64url encode (matches OpenCode web frontend xn() function)."""
+    import base64
+    raw = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return raw.replace("+", "-").replace("/", "_").replace("=", "")
+
+
 def _load_rules() -> str:
     """Load user rules, seeding from the bundled template on first use.
 
@@ -94,14 +101,23 @@ def dispatch(directory: str, task: str, title: str = "") -> str:
             "message": f"Session created but failed to send task: {e}",
         })
 
+    # Build URLs — OpenCode web UI uses /server/{b64url(serverUrl)}/session/{sessionId}
+    # (matching the _f() function in the web frontend; uses session ID, not slug)
+    server_encoded = _b64url(BASE_URL)
+    web_ui = f"{BASE_URL}/server/{server_encoded}/session/{session_id}"
+    tui_command = f"opencode attach {BASE_URL} -s {session_id}"
+
     return json.dumps({
         "status": "dispatched",
         "session_id": session_id,
         "session_name": session_title,
-        "web_ui": f"http://localhost:4096/session/{session_id}",
+        "web_ui": web_ui,
+        "tui_command": tui_command,
         "directory": directory,
         "message": (
-            f"OpenCode session '{session_title}' started.\n"
-            f"Monitor: http://localhost:4096/session/{session_id}"
+            f"OpenCode 디스패치 완료.\n"
+            f"세션: {session_title}\n"
+            f"WEB: {web_ui}\n"
+            f"TUI: {tui_command}"
         ),
     }, ensure_ascii=False)

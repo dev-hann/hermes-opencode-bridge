@@ -81,8 +81,8 @@ Sends a coding task to OpenCode via HTTP API. Creates a session, injects collabo
   "status": "dispatched",
   "session_id": "ses_abc123",
   "session_name": "Login API",
-  "web_ui": "http://localhost:4096/session/ses_abc123",
-  "message": "OpenCode session 'Login API' started.\nMonitor: http://localhost:4096/session/ses_abc123"
+  "web_ui": "http://localhost:4096/server/aHR0cDovL2xvY2FsaG9zdDo0MDk2/session/ses_abc123",
+  "message": "OpenCode session 'Login API' started.\nMonitor: http://localhost:4096/server/aHR0cDovL2xvY2FsaG9zdDo0MDk2/session/ses_abc123"
 }
 ```
 
